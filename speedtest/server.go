@@ -40,6 +40,7 @@ type Server struct {
 	ULSpeed  float64       `json:"ul_speed"`
 
 	doer *http.Client
+	prog ProgressUpdater
 }
 
 // ServerList list of Server

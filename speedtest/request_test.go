@@ -97,7 +97,7 @@ func mockWarmUp(ctx context.Context, doer *http.Client, dlURL string) error {
 	return nil
 }
 
-func mockRequest(ctx context.Context, doer *http.Client, dlURL string, w int) error {
+func mockRequest(ctx context.Context, doer *http.Client, p ProgressUpdater, dlURL string, w int) error {
 	fmt.Sprintln(w)
 	time.Sleep(500 * time.Millisecond)
 	return nil

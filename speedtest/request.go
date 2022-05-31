@@ -14,12 +14,17 @@ import (
 )
 
 type downloadWarmUpFunc func(context.Context, *http.Client, string) error
-type downloadFunc func(context.Context, *http.Client, string, int) error
+type downloadFunc func(context.Context, *http.Client, ProgressUpdater, string, int) error
 type uploadWarmUpFunc func(context.Context, *http.Client, string) error
-type uploadFunc func(context.Context, *http.Client, string, int) error
+type uploadFunc func(context.Context, *http.Client, ProgressUpdater, string, int) error
 
 var dlSizes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
 var ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} //kB
+
+// SetProgressHandler sets Server's ProgressHandler
+func (s *Server) SetProgressHandler(p ProgressUpdater) {
+	s.prog = p
+}
 
 // DownloadTest executes the test to measure download speed
 func (s *Server) DownloadTest(savingMode bool) error {
@@ -92,7 +97,7 @@ func (s *Server) downloadTestContext(
 		sTime = time.Now()
 		for i := 0; i < workload; i++ {
 			eg.Go(func() error {
-				return downloadRequest(ctx, s.doer, dlURL, weight)
+				return downloadRequest(ctx, s.doer, s.prog, dlURL, weight)
 			})
 		}
 		if err := eg.Wait(); err != nil {
@@ -167,7 +172,7 @@ func (s *Server) uploadTestContext(
 		sTime = time.Now()
 		for i := 0; i < workload; i++ {
 			eg.Go(func() error {
-				return uploadRequest(ctx, s.doer, s.URL, weight)
+				return uploadRequest(ctx, s.doer, s.prog, s.URL, weight)
 			})
 		}
 		if err := eg.Wait(); err != nil {
@@ -222,7 +227,7 @@ func ulWarmUp(ctx context.Context, doer *http.Client, ulURL string) error {
 	return err
 }
 
-func downloadRequest(ctx context.Context, doer *http.Client, dlURL string, w int) error {
+func downloadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater, dlURL string, w int) error {
 	size := dlSizes[w]
 	xdlURL := dlURL + "/random" + strconv.Itoa(size) + "x" + strconv.Itoa(size) + ".jpg"
 
@@ -236,18 +241,56 @@ func downloadRequest(ctx context.Context, doer *http.Client, dlURL string, w int
 		return err
 	}
 	defer resp.Body.Close()
-	_, err = io.Copy(ioutil.Discard, resp.Body)
+
+	// install the ProgressHandler
+	reader := resp.Body.(io.Reader)
+	if prog != nil {
+		reader = io.TeeReader(reader, WriterFunc(func(p []byte) (n int, err error) {
+			n = len(p)
+			if n != 0 {
+				prog.Update(uint64(n))
+			}
+			return n, nil
+		}))
+	}
+
+	_, err = io.Copy(ioutil.Discard, reader)
 	return err
 }
 
-func uploadRequest(ctx context.Context, doer *http.Client, ulURL string, w int) error {
+func uploadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater, ulURL string, w int) error {
 	size := ulSizes[w]
 	v := url.Values{}
 	v.Add("content", strings.Repeat("0123456789", size*100-51))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ulURL, strings.NewReader(v.Encode()))
+	reqBody := strings.NewReader(v.Encode())
+
+	var body io.Reader
+	if prog != nil {
+		body = io.TeeReader(reqBody, WriterFunc(func(p []byte) (n int, err error) {
+			n = len(p)
+			if n != 0 {
+				prog.Update(uint64(n))
+			}
+			return n, nil
+		}))
+	} else {
+		body = reqBody
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ulURL, body)
 	if err != nil {
 		return err
+	}
+
+	// have to correct the content length and GetBody, due to body type not being one of known ones
+	if prog != nil {
+		req.ContentLength = int64(reqBody.Len())
+		snapshot := *reqBody
+		req.GetBody = func() (io.ReadCloser, error) {
+			r := snapshot
+			return io.NopCloser(&r), nil
+		}
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
