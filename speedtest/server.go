@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const speedTestServersUrl = "https://www.speedtest.net/api/js/servers?engine=js&limit=10"
+const speedTestServersUrl = "https://c.speedtest.net/speedtest-servers-static.php" // local
 const speedTestServersAlternativeUrl = "https://www.speedtest.net/speedtest-servers-static.php"
 
 type PayloadType int
@@ -93,7 +93,7 @@ func (client *Speedtest) FetchServerListContext(ctx context.Context, user *User)
 		return Servers{}, err
 	}
 
-	payloadType := JSONPayload
+	payloadType := XMLPayload
 
 	if resp.ContentLength == 0 {
 		resp.Body.Close()
