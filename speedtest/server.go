@@ -23,6 +23,13 @@ const (
 	XMLPayload
 )
 
+type ServerType int
+
+const (
+	SpeedtestServer ServerType = iota
+	LibrespeedServer
+)
+
 // Server information
 type Server struct {
 	URL      string        `xml:"url,attr" json:"url"`
@@ -38,9 +45,9 @@ type Server struct {
 	Latency  time.Duration `json:"latency"`
 	DLSpeed  float64       `json:"dl_speed"`
 	ULSpeed  float64       `json:"ul_speed"`
-
-	doer *http.Client
-	prog ProgressUpdater
+	Type     ServerType    `json:"type"`
+	Doer     *http.Client
+	Prog     ProgressUpdater
 }
 
 // ServerList list of Server
@@ -139,7 +146,7 @@ func (client *Speedtest) FetchServerListContext(ctx context.Context, user *User)
 
 	// set doer of server
 	for _, s := range servers {
-		s.doer = client.doer
+		s.Doer = client.doer
 	}
 
 	// Calculate distance

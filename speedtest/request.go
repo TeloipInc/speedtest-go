@@ -3,53 +3,67 @@ package speedtest
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 )
 
-type downloadWarmUpFunc func(context.Context, *http.Client, string) error
-type downloadFunc func(context.Context, *http.Client, ProgressUpdater, string, int) error
-type uploadWarmUpFunc func(context.Context, *http.Client, string) error
-type uploadFunc func(context.Context, *http.Client, ProgressUpdater, string, int) error
+type downloadWarmUpFunc func(context.Context, *http.Client, ServerType, string, int) error
+type downloadFunc func(context.Context, *http.Client, ServerType, ProgressUpdater, string, int) error
+type uploadWarmUpFunc func(context.Context, *http.Client, ServerType, string, int) error
+type uploadFunc func(context.Context, *http.Client, ServerType, ProgressUpdater, string, int) error
 
-var dlSizes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
-var ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} //kB
+// speedtest.net jpg suffixes
+var dlSuffixes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
+var ulSuffixes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} //kB
+
+// overhead compensation factor - 4%
+const compensationFactor = 1.04
 
 // SetProgressHandler sets Server's ProgressHandler
 func (s *Server) SetProgressHandler(p ProgressUpdater) {
-	s.prog = p
+	s.Prog = p
 }
 
 // DownloadTest executes the test to measure download speed
-func (s *Server) DownloadTest(savingMode bool) error {
-	return s.downloadTestContext(context.Background(), savingMode, dlWarmUp, downloadRequest)
+func (s *Server) DownloadTest(savingMode bool, duration time.Duration) error {
+	return s.downloadTestContext(context.Background(), savingMode, duration, dlWarmUp, downloadRequest)
 }
 
 // DownloadTestContext executes the test to measure download speed, observing the given context.
-func (s *Server) DownloadTestContext(ctx context.Context, savingMode bool) error {
-	return s.downloadTestContext(ctx, savingMode, dlWarmUp, downloadRequest)
+func (s *Server) DownloadTestContext(ctx context.Context, savingMode bool, duration time.Duration) error {
+	return s.downloadTestContext(ctx, savingMode, duration, dlWarmUp, downloadRequest)
 }
 
 func (s *Server) downloadTestContext(
 	ctx context.Context,
 	savingMode bool,
+	duration time.Duration,
 	dlWarmUp downloadWarmUpFunc,
 	downloadRequest downloadFunc,
 ) error {
-	dlURL := strings.Split(s.URL, "/upload.php")[0]
 	eg := errgroup.Group{}
+
+	// choose a suffix that will result in a 1MB file download
+	var suffix int
+	if s.Type == LibrespeedServer {
+		suffix = 1 // MB
+	} else {
+		suffix = dlSuffixes[2] // jpg axis width
+	}
+
+	streams := 10
 
 	// Warming up
 	sTime := time.Now()
-	for i := 0; i < 2; i++ {
+	for i := 0; i < streams; i++ {
 		eg.Go(func() error {
-			return dlWarmUp(ctx, s.doer, dlURL)
+			return dlWarmUp(ctx, s.Doer, s.Type, s.URL, suffix)
 		})
 	}
 	if err := eg.Wait(); err != nil {
@@ -60,53 +74,74 @@ func (s *Server) downloadTestContext(
 	// If the bandwidth is too large, the download sometimes finish earlier than the latency.
 	// In this case, we ignore the the latency that is included server information.
 	// This is not affected to the final result since this is a warm up test.
-	timeToSpend := fTime.Sub(sTime.Add(s.Latency)).Seconds()
-	if timeToSpend < 0 {
-		timeToSpend = fTime.Sub(sTime).Seconds()
+	timeSpent := fTime.Sub(sTime.Add(s.Latency)).Seconds()
+	if timeSpent < 0 {
+		timeSpent = fTime.Sub(sTime).Seconds()
 	}
 
-	// 1.125MB for each request (750 * 750 * 2)
-	wuSpeed := 1.125 * 8 * 2 / timeToSpend
+	wuSpeed := float64(streams) * suffixToMB(s.Type, suffix) * 8 / timeSpent
 
-	// Decide workload by warm up speed
-	workload := 0
-	weight := 0
+	// Decide streams by warm up speed
 	skip := false
+	weight := 0
 	if savingMode {
-		workload = 6
+		streams = 6
 		weight = 3
 	} else if 50.0 < wuSpeed {
-		workload = 32
+		streams = 32
 		weight = 6
 	} else if 10.0 < wuSpeed {
-		workload = 16
+		streams = 16
 		weight = 4
 	} else if 4.0 < wuSpeed {
-		workload = 8
+		streams = 8
 		weight = 4
 	} else if 2.5 < wuSpeed {
-		workload = 4
+		streams = 4
 		weight = 4
 	} else {
 		skip = true
 	}
 
+	if s.Type == LibrespeedServer {
+		// calculate the size based on the number of streams and
+		// the fact that we need to run the speedtest for duration seconds
+		suffix = int(wuSpeed / 8 / float64(streams) * duration.Seconds())
+	} else {
+		suffix = dlSuffixes[weight]
+	}
+
 	// Main speedtest
 	dlSpeed := wuSpeed
 	if !skip {
+		control := make(chan int, streams)
+
+		var totalBytes atomic.Int64
+		byteTracker := func(nbytes uint64) {
+			totalBytes.Add(int64(nbytes))
+			if s.Prog != nil {
+				s.Prog.Update(nbytes)
+			}
+		}
+
 		sTime = time.Now()
-		for i := 0; i < workload; i++ {
+		eTime := sTime.Add(duration)
+		timedCtx, cancel := context.WithDeadline(ctx, eTime)
+		for {
+			control <- 747
+			if time.Now().After(eTime) {
+				cancel()
+				break
+			}
 			eg.Go(func() error {
-				return downloadRequest(ctx, s.doer, s.prog, dlURL, weight)
+				err := downloadRequest(timedCtx, s.Doer, s.Type, ProgressUpdaterFunc(byteTracker), s.URL, suffix)
+				<-control
+				return err
 			})
 		}
-		if err := eg.Wait(); err != nil {
-			return err
-		}
+		eg.Wait()
 		fTime = time.Now()
-
-		reqMB := dlSizes[weight] * dlSizes[weight] * 2 / 1000 / 1000
-		dlSpeed = float64(reqMB) * 8 * float64(workload) / fTime.Sub(sTime).Seconds()
+		dlSpeed = float64(totalBytes.Load()/1024/1024) * compensationFactor * 8 / fTime.Sub(sTime).Seconds()
 	}
 
 	s.DLSpeed = dlSpeed
@@ -114,84 +149,105 @@ func (s *Server) downloadTestContext(
 }
 
 // UploadTest executes the test to measure upload speed
-func (s *Server) UploadTest(savingMode bool) error {
-	return s.uploadTestContext(context.Background(), savingMode, ulWarmUp, uploadRequest)
+func (s *Server) UploadTest(savingMode bool, duration time.Duration) error {
+	return s.uploadTestContext(context.Background(), savingMode, duration, ulWarmUp, uploadRequest)
 }
 
 // UploadTestContext executes the test to measure upload speed, observing the given context.
-func (s *Server) UploadTestContext(ctx context.Context, savingMode bool) error {
-	return s.uploadTestContext(ctx, savingMode, ulWarmUp, uploadRequest)
+func (s *Server) UploadTestContext(ctx context.Context, savingMode bool, duration time.Duration) error {
+	return s.uploadTestContext(ctx, savingMode, duration, ulWarmUp, uploadRequest)
 }
 func (s *Server) uploadTestContext(
 	ctx context.Context,
 	savingMode bool,
+	duration time.Duration,
 	ulWarmUp uploadWarmUpFunc,
 	uploadRequest uploadFunc,
 ) error {
+	eg := errgroup.Group{}
+
+	// we need a 1MB file upload
+	sizeKB := dlSuffixes[4]
+
+	streams := 2
+
 	// Warm up
 	sTime := time.Now()
-	eg := errgroup.Group{}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < streams; i++ {
 		eg.Go(func() error {
-			return ulWarmUp(ctx, s.doer, s.URL)
+			return ulWarmUp(ctx, s.Doer, s.Type, s.URL, sizeKB)
 		})
 	}
 	if err := eg.Wait(); err != nil {
 		return err
 	}
 	fTime := time.Now()
-	// 1.0 MB for each request
-	wuSpeed := 1.0 * 8 * 2 / fTime.Sub(sTime.Add(s.Latency)).Seconds()
 
-	// Decide workload by warm up speed
-	workload := 0
-	weight := 0
+	// 1.0 MB for each request
+	wuSpeed := 2 * 1.0 * 8 / fTime.Sub(sTime.Add(s.Latency)).Seconds()
+
+	// Decide streams by warm up speed
 	skip := false
+	weight := 0
 	if savingMode {
-		workload = 1
+		streams = 1
 		weight = 7
 	} else if 50.0 < wuSpeed {
-		workload = 40
+		streams = 40
 		weight = 9
 	} else if 10.0 < wuSpeed {
-		workload = 16
+		streams = 16
 		weight = 9
 	} else if 4.0 < wuSpeed {
-		workload = 8
+		streams = 8
 		weight = 9
 	} else if 2.5 < wuSpeed {
-		workload = 4
+		streams = 4
 		weight = 5
 	} else {
 		skip = true
 	}
+	sizeKB = ulSuffixes[weight]
 
 	// Main speedtest
 	ulSpeed := wuSpeed
 	if !skip {
+		control := make(chan int, streams)
+
+		var totalBytes atomic.Int64
+		byteTracker := func(nbytes uint64) {
+			totalBytes.Add(int64(nbytes))
+			if s.Prog != nil {
+				s.Prog.Update(nbytes)
+			}
+		}
+
 		sTime = time.Now()
-		for i := 0; i < workload; i++ {
+		eTime := sTime.Add(duration)
+		timedCtx, cancel := context.WithDeadline(ctx, eTime)
+		for {
+			control <- 747
+			if time.Now().After(eTime) {
+				cancel()
+				break
+			}
 			eg.Go(func() error {
-				return uploadRequest(ctx, s.doer, s.prog, s.URL, weight)
+				err := uploadRequest(timedCtx, s.Doer, s.Type, ProgressUpdaterFunc(byteTracker), s.URL, sizeKB)
+				<-control
+				return err
 			})
 		}
-		if err := eg.Wait(); err != nil {
-			return err
-		}
+		eg.Wait()
 		fTime = time.Now()
-
-		reqMB := float64(ulSizes[weight]) / 1000
-		ulSpeed = reqMB * 8 * float64(workload) / fTime.Sub(sTime).Seconds()
+		ulSpeed = float64(totalBytes.Load()/1024/1024) * compensationFactor * 8 / fTime.Sub(sTime).Seconds()
 	}
 
 	s.ULSpeed = ulSpeed
-
 	return nil
 }
 
-func dlWarmUp(ctx context.Context, doer *http.Client, dlURL string) error {
-	size := dlSizes[2]
-	xdlURL := dlURL + "/random" + strconv.Itoa(size) + "x" + strconv.Itoa(size) + ".jpg"
+func dlWarmUp(ctx context.Context, doer *http.Client, serverType ServerType, dlURL string, suffix int) error {
+	xdlURL := getDownloadURL(dlURL, serverType, suffix)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xdlURL, nil)
 	if err != nil {
@@ -203,16 +259,17 @@ func dlWarmUp(ctx context.Context, doer *http.Client, dlURL string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, err = io.Copy(ioutil.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
 	return err
 }
 
-func ulWarmUp(ctx context.Context, doer *http.Client, ulURL string) error {
-	size := ulSizes[4]
-	v := url.Values{}
-	v.Add("content", strings.Repeat("0123456789", size*100-51))
+func ulWarmUp(ctx context.Context, doer *http.Client, serverType ServerType, ulURL string, sizeKB int) error {
+	xulURL := getUploadURL(ulURL, serverType)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ulURL, strings.NewReader(v.Encode()))
+	v := url.Values{}
+	v.Add("content", strings.Repeat("0123456789", sizeKB*100-51))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, xulURL, strings.NewReader(v.Encode()))
 	if err != nil {
 		return err
 	}
@@ -223,13 +280,12 @@ func ulWarmUp(ctx context.Context, doer *http.Client, ulURL string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, err = io.Copy(ioutil.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
 	return err
 }
 
-func downloadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater, dlURL string, w int) error {
-	size := dlSizes[w]
-	xdlURL := dlURL + "/random" + strconv.Itoa(size) + "x" + strconv.Itoa(size) + ".jpg"
+func downloadRequest(ctx context.Context, doer *http.Client, serverType ServerType, prog ProgressUpdater, dlURL string, suffix int) error {
+	xdlURL := getDownloadURL(dlURL, serverType, suffix)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xdlURL, nil)
 	if err != nil {
@@ -254,14 +310,15 @@ func downloadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdate
 		}))
 	}
 
-	_, err = io.Copy(ioutil.Discard, reader)
+	_, err = io.Copy(io.Discard, reader)
 	return err
 }
 
-func uploadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater, ulURL string, w int) error {
-	size := ulSizes[w]
+func uploadRequest(ctx context.Context, doer *http.Client, serverType ServerType, prog ProgressUpdater, ulURL string, sizeKB int) error {
+	xulURL := getUploadURL(ulURL, serverType)
+
 	v := url.Values{}
-	v.Add("content", strings.Repeat("0123456789", size*100-51))
+	v.Add("content", strings.Repeat("0123456789", sizeKB*100-51))
 
 	reqBody := strings.NewReader(v.Encode())
 
@@ -278,7 +335,7 @@ func uploadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater,
 		body = reqBody
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ulURL, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, xulURL, body)
 	if err != nil {
 		return err
 	}
@@ -300,7 +357,7 @@ func uploadRequest(ctx context.Context, doer *http.Client, prog ProgressUpdater,
 	}
 	defer resp.Body.Close()
 
-	_, err = io.Copy(ioutil.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
 	return err
 }
 
@@ -311,18 +368,18 @@ func (s *Server) PingTest() error {
 
 // PingTestContext executes test to measure latency, observing the given context.
 func (s *Server) PingTestContext(ctx context.Context) error {
-	pingURL := strings.Split(s.URL, "/upload.php")[0] + "/latency.txt"
+	xpingURL := getPingURL(s.URL, s.Type)
 
 	l := time.Second * 10
 	for i := 0; i < 3; i++ {
 		sTime := time.Now()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pingURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, xpingURL, nil)
 		if err != nil {
 			return err
 		}
 
-		resp, err := s.doer.Do(req)
+		resp, err := s.Doer.Do(req)
 		if err != nil {
 			return err
 		}
@@ -338,4 +395,39 @@ func (s *Server) PingTestContext(ctx context.Context) error {
 	s.Latency = time.Duration(int64(l.Nanoseconds() / 2))
 
 	return nil
+}
+
+func suffixToMB(serverType ServerType, suffix int) float64 {
+	if serverType == LibrespeedServer {
+		return float64(suffix)
+	} else {
+		// matching jpg resources found at http://speedtest.tds.net/speedtest/
+		return float64(suffix) * float64(suffix) * 2 / 1000 / 1000
+	}
+}
+
+func getDownloadURL(serverUrl string, serverType ServerType, suffix int) string {
+	if serverType == SpeedtestServer {
+		// for speedtest.net server url is an upload URL
+		baseUrl := strings.Split(serverUrl, "/upload.php")[0]
+		return baseUrl + "/random" + strconv.Itoa(suffix) + "x" + strconv.Itoa(suffix) + ".jpg"
+	}
+	return serverUrl + "/garbage?cors=true&ckSize=" + strconv.Itoa(suffix)
+}
+
+func getUploadURL(serverUrl string, serverType ServerType) string {
+	if serverType == SpeedtestServer {
+		// for speedtest.net server url is an upload URL
+		return serverUrl
+	}
+	return serverUrl + "/empty?cors=true&ckSize=10"
+}
+
+func getPingURL(serverUrl string, serverType ServerType) string {
+	if serverType == SpeedtestServer {
+		// for speedtest.net server url is an upload URL
+		baseUrl := strings.Split(serverUrl, "/upload.php")[0]
+		return baseUrl + "/latency.txt"
+	}
+	return serverUrl + "/empty?cors=true&ckSize=1"
 }

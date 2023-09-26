@@ -46,7 +46,7 @@ func main() {
 	targets, err := servers.FindServer(*serverIds)
 	checkError(err)
 
-	startTest(targets, *savingMode, *jsonOutput)
+	startTest(targets, *savingMode, 15*time.Second, *jsonOutput)
 
 	if *jsonOutput {
 		jsonBytes, err := json.Marshal(
@@ -62,7 +62,7 @@ func main() {
 	}
 }
 
-func startTest(servers speedtest.Servers, savingMode bool, jsonOutput bool) {
+func startTest(servers speedtest.Servers, savingMode bool, duration time.Duration, jsonOutput bool) {
 	for _, s := range servers {
 		if !jsonOutput {
 			showServer(s)
@@ -72,10 +72,10 @@ func startTest(servers speedtest.Servers, savingMode bool, jsonOutput bool) {
 		checkError(err)
 
 		if jsonOutput {
-			err := s.DownloadTest(savingMode)
+			err := s.DownloadTest(savingMode, duration)
 			checkError(err)
 
-			err = s.UploadTest(savingMode)
+			err = s.UploadTest(savingMode, duration)
 			checkError(err)
 
 			continue
@@ -83,9 +83,9 @@ func startTest(servers speedtest.Servers, savingMode bool, jsonOutput bool) {
 
 		showLatencyResult(s)
 
-		err = testDownload(s, savingMode)
+		err = testDownload(s, savingMode, duration)
 		checkError(err)
-		err = testUpload(s, savingMode)
+		err = testUpload(s, savingMode, duration)
 		checkError(err)
 
 		showServerResult(s)
@@ -96,11 +96,11 @@ func startTest(servers speedtest.Servers, savingMode bool, jsonOutput bool) {
 	}
 }
 
-func testDownload(server *speedtest.Server, savingMode bool) error {
+func testDownload(server *speedtest.Server, savingMode bool, duration time.Duration) error {
 	quit := make(chan bool)
 	fmt.Printf("Download Test: ")
 	go dots(quit)
-	err := server.DownloadTest(savingMode)
+	err := server.DownloadTest(savingMode, duration)
 	quit <- true
 	if err != nil {
 		return err
@@ -109,11 +109,11 @@ func testDownload(server *speedtest.Server, savingMode bool) error {
 	return err
 }
 
-func testUpload(server *speedtest.Server, savingMode bool) error {
+func testUpload(server *speedtest.Server, savingMode bool, duration time.Duration) error {
 	quit := make(chan bool)
 	fmt.Printf("Upload Test: ")
 	go dots(quit)
-	err := server.UploadTest(savingMode)
+	err := server.UploadTest(savingMode, duration)
 	quit <- true
 	if err != nil {
 		return err

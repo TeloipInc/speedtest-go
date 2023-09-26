@@ -18,6 +18,7 @@ func TestDownloadTestContext(t *testing.T) {
 	err := server.downloadTestContext(
 		context.Background(),
 		false,
+		15*time.Second,
 		mockWarmUp,
 		mockRequest,
 	)
@@ -39,6 +40,7 @@ func TestDownloadTestContextSavingMode(t *testing.T) {
 	err := server.downloadTestContext(
 		context.Background(),
 		true,
+		15*time.Second,
 		mockWarmUp,
 		mockRequest,
 	)
@@ -60,6 +62,7 @@ func TestUploadTestContext(t *testing.T) {
 	err := server.uploadTestContext(
 		context.Background(),
 		false,
+		15*time.Second,
 		mockWarmUp,
 		mockRequest,
 	)
@@ -81,6 +84,7 @@ func TestUploadTestContextSavingMode(t *testing.T) {
 	err := server.uploadTestContext(
 		context.Background(),
 		true,
+		15*time.Second,
 		mockWarmUp,
 		mockRequest,
 	)
@@ -92,12 +96,12 @@ func TestUploadTestContextSavingMode(t *testing.T) {
 	}
 }
 
-func mockWarmUp(ctx context.Context, doer *http.Client, dlURL string) error {
+func mockWarmUp(ctx context.Context, doer *http.Client, serverType ServerType, dlURL string, w int) error {
 	time.Sleep(100 * time.Millisecond)
 	return nil
 }
 
-func mockRequest(ctx context.Context, doer *http.Client, p ProgressUpdater, dlURL string, w int) error {
+func mockRequest(ctx context.Context, doer *http.Client, serverType ServerType, p ProgressUpdater, dlURL string, w int) error {
 	fmt.Sprintln(w)
 	time.Sleep(500 * time.Millisecond)
 	return nil
