@@ -129,7 +129,7 @@ func (s *Server) downloadTestContext(
 		timedCtx, cancel := context.WithDeadline(ctx, eTime)
 		for {
 			control <- 747
-			if time.Now().After(eTime) {
+			if time.Now().After(eTime) || timedCtx.Err() != nil {
 				cancel()
 				break
 			}
@@ -227,7 +227,7 @@ func (s *Server) uploadTestContext(
 		timedCtx, cancel := context.WithDeadline(ctx, eTime)
 		for {
 			control <- 747
-			if time.Now().After(eTime) {
+			if time.Now().After(eTime) || timedCtx.Err() != nil {
 				cancel()
 				break
 			}
